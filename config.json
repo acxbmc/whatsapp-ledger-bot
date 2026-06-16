@@ -1,0 +1,8 @@
+{
+  "for-profit": {
+    "sheet_name": "Whatsapp_Bot_Ledger"
+  },
+  "ngo": {
+    "sheet_name": "NGO_Grant_Ledger"
+  }
+}
