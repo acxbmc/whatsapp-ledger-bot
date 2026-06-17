@@ -17,6 +17,7 @@ import os
 import tempfile
 import requests
 import time
+import threading
 from collections import deque
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -308,7 +309,9 @@ def build_corrections_context(entity_type: str) -> str:
     lines.append("Users have previously corrected these classifications. Apply these lessons:")
     for c in corrections:
         if c["field"] == "activity_code":
-            lines.append(f"  - For '{c['activity']}': use '{c['new']}' not '{c['old']}'")
+            lines.append(f"  - For '{c['activity']}': use activity code '{c['new']}' not '{c['old']}'")
+        elif c["field"] == "category":
+            lines.append(f"  - For '{c['activity']}': use account/category '{c['new']}' not '{c['old']}'")
         elif c["field"] == "amount":
             lines.append(f"  - Amount '{c['old']}' was corrected to '{c['new']}' for '{c['activity']}'")
         else:
@@ -342,6 +345,33 @@ REMOVEUSER_PREFIX = "removeuser "
 retry_queue: dict[str, list] = {}
 MAX_RETRY_ATTEMPTS  = 3
 RETRY_DELAY_SECONDS = 15   # wait 15s between attempts
+
+# --- Message ID deduplication ---
+# WhatsApp/Meta can redeliver the same webhook notification (e.g. if our
+# response is slow, or if multiple apps are subscribed). Each message has a
+# unique id ("wamid..."). We remember IDs we've already processed so a
+# redelivered duplicate is silently ignored instead of being handled twice.
+processed_message_ids: dict[str, datetime.datetime] = {}
+MESSAGE_ID_DEDUP_HOURS = 24
+
+def is_duplicate_message_id(message_id: str) -> bool:
+    """Returns True if this message id was already processed recently."""
+    if not message_id:
+        return False  # can't dedupe without an id — let it through
+
+    now = datetime.datetime.now()
+    cutoff = now - datetime.timedelta(hours=MESSAGE_ID_DEDUP_HOURS)
+
+    # Light cleanup of old entries so this dict doesn't grow forever
+    for mid in list(processed_message_ids.keys()):
+        if processed_message_ids[mid] < cutoff:
+            del processed_message_ids[mid]
+
+    if message_id in processed_message_ids:
+        return True
+
+    processed_message_ids[message_id] = now
+    return False
 
 # =====================================================================
 # 6. PYDANTIC SCHEMA
@@ -434,6 +464,32 @@ def fetch_coa_rules(entity_type: str) -> list[str]:
     except Exception as e:
         log.error(f"Could not read CoA_Reference for '{entity_type}': {e}")
         return []
+
+
+def coa_pair_exists(entity_type: str, category: str, activity_code: str) -> bool:
+    """Check whether this exact (category, activity_code) pair already exists in the CoA."""
+    rules  = fetch_coa_rules(entity_type)
+    target = f"{category.strip()} -> {activity_code.strip()}"
+    return target in rules
+
+
+def add_coa_entry(entity_type: str, category: str, activity_code: str) -> bool:
+    """
+    Append a new (Main Account, Activity Code) pair to the CoA_Reference tab
+    so future messages with this classification are recognised automatically.
+    Refreshes the in-memory cache so it's available on the very next message.
+    Returns True on success, False if it could not be written.
+    """
+    sheet_name = accounting_config.get(entity_type, {}).get("sheet_name", "NGO_Grant_Ledger")
+    try:
+        coa_sheet = gc_client.open(sheet_name).worksheet("CoA_Reference")
+        coa_sheet.append_row([category.strip(), activity_code.strip()])
+        log.info(f"Added new CoA entry for '{entity_type}': {category} -> {activity_code}")
+        _coa_cache.pop(entity_type, None)  # force refresh on next fetch
+        return True
+    except Exception as e:
+        log.error(f"Could not add new CoA entry for '{entity_type}': {e}")
+        return False
 
 
 def build_coa_context(entity_type: str) -> str:
@@ -905,16 +961,16 @@ HELP_REPLY_STAFF = (
     "*What I can do for you:*\n\n"
     "*Log an expense*\n"
     "Just describe it naturally:\n"
-    "  \"Home tracing for James to Buikwe, 50,000 meals, 20,000 transport\"\n"
+    "  \"Spent 300,000 paying school fees for John at ABC Primary School\"\n"
     "  \"Bought soap 20,000 and vaseline 3,000\"\n\n"
     "*After I show you a summary:*\n"
-    "  yes        - save the transactions\n"
-    "  no         - cancel and discard\n"
-    "  correct    - fix something before saving\n\n"
+    "  Yes        - Save the transactions\n"
+    "  No         - Cancel and discard\n"
+    "  Correct    - Fix something before saving\n\n"
     "*Other commands:*\n"
-    "  balance    - see your total income and expenses\n"
-    "  undo       - delete your last saved entry\n"
-    "  help       - show this menu\n\n"
+    "  Balance    - See your total income and expenses\n"
+    "  Undo       - Delete your last saved entry\n"
+    "  Help       - Show this menu\n\n"
     "Send me a transaction message to get started!"
 )
 
@@ -922,30 +978,30 @@ HELP_REPLY_ADMIN = (
     "*What I can do for you:*\n\n"
     "*Log an expense*\n"
     "Just describe it naturally:\n"
-    "  \"Home tracing for James to Buikwe, 50,000 meals, 20,000 transport\"\n\n"
+    "  \"Spent 300,000 paying school fees for John at ABC Primary School\"\n\n"
     "*After I show you a summary:*\n"
-    "  yes / no / correct\n\n"
+    "  Yes / No / Correct\n\n"
     "*Staff commands:*\n"
-    "  balance    - your income and expense totals\n"
-    "  undo       - delete your last entry\n\n"
+    "  Balance    - your income and expense totals\n"
+    "  Undo       - delete your last entry\n\n"
     "*Admin commands:*\n"
-    "  adduser <phone> <name> <role>  - add a new user\n"
-    "  removeuser <phone>             - deactivate a user\n"
-    "  listusers                      - see all active users\n\n"
+    "  adduser <phone> <name> <role>  - Add a new user\n"
+    "  removeuser <phone>             - Deactivate a user\n"
+    "  listusers                      - See all active users\n\n"
     "Example:\n"
     "  adduser 256700123456 Jane Apio staff"
 )
 
 HELP_REPLY_MASTER = (
     "*Master commands:*\n\n"
-    "  invoice  - create a new invoice/receipt for a client\n\n"
+    "  Invoice  - create a new invoice/receipt for a client\n\n"
     "Once started, follow the prompts:\n"
     "  - Enter client name\n"
     "  - Enter client address (or 'skip')\n"
     "  - Add items as: description, amount\n"
     "  - Type 'done' when finished\n"
     "  - Review, then 'yes' to generate the PDF\n"
-    "  - 'edit' to fix something, 'cancel' to discard\n"
+    "  - 'Edit' to fix something, 'Cancel' to discard\n"
 )
 
 def get_help_reply(user: dict | None, phone: str = "") -> str:
@@ -965,10 +1021,16 @@ def get_help_reply(user: dict | None, phone: str = "") -> str:
 # =====================================================================
 CORRECTABLE_FIELDS = {
     "1": "amount",   "2": "who",       "3": "location",  "4": "line_item",
+    "5": "category", "6": "activity_code",
     "amount":    "amount",  "person":   "who",  "who":      "who",
     "name":      "who",     "location": "location", "district": "location",
     "place":     "location","item":     "line_item", "line item": "line_item",
     "type":      "line_item",
+    "category":      "category", "account": "category",
+    "account name":  "category", "main account": "category",
+    "activity":      "activity_code", "activity code": "activity_code",
+    "code":          "activity_code", "sub account": "activity_code",
+    "sub-account":   "activity_code",
 }
 
 def build_correction_menu(batch: dict) -> str:
@@ -978,6 +1040,8 @@ def build_correction_menu(batch: dict) -> str:
     lines.append("  2 - Person name (who)")
     lines.append("  3 - Location / district")
     lines.append("  4 - Line item / spend type")
+    lines.append("  5 - Account Name (category)")
+    lines.append("  6 - Activity Code")
     if len(batch["transactions"]) > 1:
         lines.append("\nWhich transaction? Reply field then number.")
         lines.append("e.g. \"1 2\" = fix the amount of transaction 2")
@@ -999,7 +1063,8 @@ def apply_correction(phone: str, raw_text: str, user: dict | None) -> bool:
             send_whatsapp_reply(
                 phone,
                 "Sorry, I did not recognise that field.\n"
-                "Reply with 1 (amount), 2 (person), 3 (location), or 4 (line item)."
+                "Reply with 1 (amount), 2 (person), 3 (location), 4 (line item), "
+                "5 (account name), or 6 (activity code)."
             )
             return True
 
@@ -1019,7 +1084,9 @@ def apply_correction(phone: str, raw_text: str, user: dict | None) -> bool:
             "amount":    "amount (numbers only, e.g. 45000)",
             "who":       "person's name",
             "location":  "location or district",
-            "line_item": "line item / spend type"
+            "line_item": "line item / spend type",
+            "category":  "Account Name (e.g. '4700 - Social Work & Field')",
+            "activity_code": "Activity Code (e.g. '4701 - Home Tracing')",
         }
         tx = batch["transactions"][tx_index]
         send_whatsapp_reply(
@@ -1059,8 +1126,26 @@ def apply_correction(phone: str, raw_text: str, user: dict | None) -> bool:
             f"to {t['location']} - {t['line_item']}"
         )
 
-        # Persist correction to Corrections tab for future learning
+        # --- If the Account Name or Activity Code was corrected, make sure ---
+        # --- this classification exists in the Chart of Accounts. If it   ---
+        # --- doesn't, add it now so future messages recognise it too.     ---
+        coa_note = ""
         entity_type = user["entity_type"] if user else DEFAULT_ENTITY_TYPE
+        if field in ("category", "activity_code"):
+            if not coa_pair_exists(entity_type, t["category"], t["activity_code"]):
+                added = add_coa_entry(entity_type, t["category"], t["activity_code"])
+                if added:
+                    coa_note = (
+                        f"\n\nNote: '{t['category']} -> {t['activity_code']}' was not in "
+                        "your Chart of Accounts, so I've added it for future use."
+                    )
+                else:
+                    coa_note = (
+                        "\n\nNote: I could not automatically add this classification to "
+                        "your Chart of Accounts. You may want to add it manually."
+                    )
+
+        # Persist correction to Corrections tab for future learning
         log_correction_to_sheet(
             phone        = phone,
             field        = field,
@@ -1074,7 +1159,7 @@ def apply_correction(phone: str, raw_text: str, user: dict | None) -> bool:
 
         send_whatsapp_reply(
             phone,
-            f"Correction applied.\n\n"
+            f"Correction applied.{coa_note}\n\n"
             f"Updated summary:\n{build_preview_message(batch, phone)}"
         )
         return True
@@ -1335,7 +1420,7 @@ def handle_master_command(raw_text: str, phone: str) -> bool:
         send_whatsapp_reply(
             phone,
             "*Master commands:*\n\n"
-            "  invoice  - create a new invoice/receipt\n\n"
+            "  Invoice  - Create a new invoice/receipt\n\n"
             "Once started, follow the prompts:\n"
             "  - Enter client name\n"
             "  - Enter client address (or 'skip')\n"
@@ -1900,7 +1985,16 @@ def webhook():
                 log.info("Status update / read receipt received. Ignored.")
                 return jsonify({"status": "ignored"}), 200
 
-            message = value["messages"][0]
+            message    = value["messages"][0]
+            message_id = message.get("id", "")
+
+            # --- Deduplication safety net ---
+            # Meta can redeliver the same notification (slow response, multiple
+            # subscribed apps, etc.). If we've already processed this exact
+            # message id, acknowledge and stop here — do not process twice.
+            if is_duplicate_message_id(message_id):
+                log.info(f"Duplicate message id {message_id} ignored.")
+                return jsonify({"status": "duplicate_ignored"}), 200
 
             if message.get("type") != "text":
                 log.info(f"Non-text message type '{message.get('type')}' received. Ignored.")
@@ -1908,7 +2002,17 @@ def webhook():
 
             raw_text     = message["text"]["body"]
             sender_phone = message["from"]
-            handle_incoming_whatsapp_message(raw_text, sender_phone)
+
+            # --- Respond to Meta immediately, process in the background ---
+            # Meta expects a fast HTTP 200. If we make Gemini calls (which can
+            # take 15-45+ seconds during retries) before responding, Meta times
+            # out and redelivers the SAME message, causing duplicate processing.
+            # Handing off to a background thread lets us return 200 right away.
+            threading.Thread(
+                target=handle_incoming_whatsapp_message,
+                args=(raw_text, sender_phone),
+                daemon=True
+            ).start()
 
         except (KeyError, IndexError, TypeError) as e:
             log.info(f"Unhandled payload structure: {e}. Ignored.")
