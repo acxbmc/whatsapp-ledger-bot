@@ -1,5 +1,6 @@
 import sys
 import io
+import re
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -235,6 +236,103 @@ def invalidate_users_cache():
     global _users_cache_time
     _users_cache_time = None
 
+
+def fetch_master_orgs() -> list[dict]:
+    """
+    Return ALL org memberships for the master phone from the Users tab.
+    Each entry: { "name": display_name, "sheet_name": sheet_to_write_to }.
+    Used so the master can be a member of multiple client orgs at once.
+    """
+    if not MASTER_PHONE:
+        return []
+
+    base_sheet_name = accounting_config.get("ngo", {}).get("sheet_name", "NGO_Grant_Ledger")
+    try:
+        users_sheet = gc_client.open(base_sheet_name).worksheet(USERS_TAB_NAME)
+        all_rows    = users_sheet.get_all_values()[1:]
+        orgs = []
+        for row in all_rows:
+            if not row or not row[0].strip():
+                continue
+            phone_val = row[0].strip().replace(" ", "").replace("+", "")
+            if phone_val != MASTER_PHONE:
+                continue
+            status = row[7].strip().lower() if len(row) > 7 else "active"
+            if status == "inactive":
+                continue
+            sheet_override = row[4].strip() if len(row) > 4 else ""
+            entity_type    = row[2].strip().lower() if len(row) > 2 else DEFAULT_ENTITY_TYPE
+            sheet_name = sheet_override or accounting_config.get(
+                entity_type, {}
+            ).get("sheet_name", "NGO_Grant_Ledger")
+            org_name = sheet_override or entity_type.upper()
+            orgs.append({"name": org_name, "sheet_name": sheet_name})
+        return orgs
+    except Exception as e:
+        log.error(f"Could not fetch master orgs: {e}")
+        return []
+
+
+def get_master_active_sheet(phone: str) -> tuple[str | None, bool]:
+    """
+    Resolve which sheet the master user should currently write to.
+
+    Returns:
+        (sheet_name, needs_choice)
+        - If sheet_name is set and needs_choice is False → proceed normally
+        - If sheet_name is None and needs_choice is True → a prompt was sent,
+          caller should return early and wait for the user's reply
+    """
+    global master_session_state, master_routing_state
+
+    # Check active session
+    session = master_session_state
+    if session.get("sheet_name") and session.get("expires_at"):
+        if datetime.datetime.now() < session["expires_at"]:
+            return (session["sheet_name"], False)
+        else:
+            master_session_state = {}   # expired — clear it
+
+    # Resolve orgs
+    test_sheet = accounting_config.get("ngo", {}).get("sheet_name", "NGO_Grant_Ledger")
+    orgs = fetch_master_orgs()
+
+    if not orgs:
+        # Master not in any org → default to test sheet
+        expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+        master_session_state = {
+            "sheet_name": test_sheet,
+            "org_name":   "Test Sheet",
+            "expires_at": expires,
+        }
+        return (test_sheet, False)
+
+    if len(orgs) == 1:
+        # Only one org → auto-route, tell them
+        expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+        master_session_state = {
+            "sheet_name": orgs[0]["sheet_name"],
+            "org_name":   orgs[0]["name"],
+            "expires_at": expires,
+        }
+        send_whatsapp_reply(
+            phone,
+            f"Routing to *{orgs[0]['name']}* for the next {MASTER_SESSION_HOURS} hours.\n"
+            "Type *switch sheet* to change at any time."
+            "Type *switch sheet* to change at any time."
+        )
+        return (orgs[0]["sheet_name"], False)
+
+    # Multiple orgs → ask master to choose
+    master_routing_state = {"orgs": orgs}
+    lines = ["You are registered with multiple organisations. Which one should I log to?\n"]
+    for i, org in enumerate(orgs, 1):
+        lines.append(f"  {i}. {org['name']}")
+    lines.append(f"  {len(orgs) + 1}. Test Sheet (NGO_Grant_Ledger)")
+    lines.append("\nReply with the number.")
+    send_whatsapp_reply(phone, "\n".join(lines))
+    return (None, True)
+
 # =====================================================================
 # 4. LEARN FROM CORRECTIONS — Store corrections to improve future prompts
 # =====================================================================
@@ -353,6 +451,32 @@ RETRY_DELAY_SECONDS = 15   # wait 15s between attempts
 # redelivered duplicate is silently ignored instead of being handled twice.
 processed_message_ids: dict[str, datetime.datetime] = {}
 MESSAGE_ID_DEDUP_HOURS = 24
+
+# --- Master user session routing ---
+# Remembers which org sheet the master has chosen to write to for 2 hours.
+# Structure: { "sheet_name": str, "org_name": str, "expires_at": datetime }
+master_session_state: dict = {}
+MASTER_SESSION_HOURS = 2
+
+# --- Master org-choice state ---
+# Set when master has multiple orgs and we need them to pick one.
+# Structure: { "orgs": [{"name": str, "sheet_name": str}, ...] }
+master_routing_state: dict = {}
+
+# --- Pending receipt references ---
+# After a batch is confirmed, we store info here so a follow-up photo
+# can be linked to the right sheet rows.
+# Structure: { "TXN-2026-0001": { "phone": str, "sheet_name": str,
+#              "row_numbers": [int, ...], "expires_at": datetime } }
+pending_receipt_refs: dict[str, dict] = {}
+RECEIPT_REF_HOURS   = 48     # refs expire after 48 hours
+RECEIPT_REF_PATTERN = re.compile(r"\bTXN-\d{4}-\d{4}\b", re.IGNORECASE)
+
+# Master sheet-switch keywords (only the master phone can use these)
+MASTER_SWITCH_KEYWORDS = {
+    "test mode", "switch to test", "test sheet", "testing mode",
+    "switch sheet", "switch org", "change org", "change sheet",
+}
 
 def is_duplicate_message_id(message_id: str) -> bool:
     """Returns True if this message id was already processed recently."""
@@ -712,13 +836,48 @@ def register_fingerprint(phone: str, fingerprint: str):
 # =====================================================================
 # 11. WRITE TO GOOGLE SHEETS
 # =====================================================================
-def write_batch_to_sheet(phone: str, batch: dict, user: dict) -> tuple[int, int]:
+def generate_transaction_ref(sheet_name: str) -> str:
+    """
+    Generate the next TXN reference number for a given sheet (TXN-YYYY-NNNN).
+    Scans column N of the sheet to find the highest sequence for this year.
+    Falls back to a timestamp-based ref if the sheet can't be read.
+    """
+    year = datetime.datetime.now().year
+    prefix = f"TXN-{year}-"
+    try:
+        ws       = gc_client.open(sheet_name).sheet1
+        col_n    = ws.col_values(14)  # column N, 1-indexed = 14
+        max_seq  = 0
+        for cell in col_n[1:]:  # skip header
+            if cell.startswith(prefix):
+                try:
+                    seq = int(cell.split("-")[-1])
+                    max_seq = max(max_seq, seq)
+                except (ValueError, IndexError):
+                    pass
+        return f"{prefix}{max_seq + 1:04d}"
+    except Exception:
+        return f"{prefix}{datetime.datetime.now().strftime('%m%d%H%M%S')}"
+
+
+def write_batch_to_sheet(phone: str, batch: dict, user: dict) -> tuple[int, int, str]:
+    """
+    Write confirmed transactions to the correct Google Sheet.
+    Returns (written_count, skipped_count, transaction_ref).
+    The ref is stored in pending_receipt_refs so a follow-up photo
+    can be linked back to these exact rows.
+    """
     transactions     = batch["transactions"]
     primary_activity = batch["primary_activity"]
     entity_type      = user["entity_type"]
     written, skipped = 0, 0
+    row_numbers      = []
 
     target_sheet = get_user_sheet(user)
+    sheet_name   = target_sheet.spreadsheet.title
+
+    # Generate one reference for the whole batch
+    txn_ref = generate_transaction_ref(sheet_name)
 
     for item in transactions:
         if (
@@ -730,11 +889,14 @@ def write_batch_to_sheet(phone: str, batch: dict, user: dict) -> tuple[int, int]
             skipped += 1
             continue
 
+        # Grab current row count BEFORE appending so we know the new row's index
+        current_count = len(target_sheet.get_all_values())
+
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row = [
             timestamp,
             phone,
-            user.get("name", "Unknown"),   # NEW: staff member's name
+            user.get("name", "Unknown"),
             primary_activity,
             item["purpose"],
             item["line_item"],
@@ -744,13 +906,27 @@ def write_batch_to_sheet(phone: str, batch: dict, user: dict) -> tuple[int, int]
             item["category"],
             item["activity_code"],
             item["type"],
-            item["record_type"]
+            item["record_type"],
+            txn_ref,   # N: Reference
+            "",        # O: Receipt Link (filled later when photo arrives)
         ]
         target_sheet.append_row(row)
-        log.info(f"Row written for {user.get('name')} ({phone}): {row}")
+        row_numbers.append(current_count + 1)  # 1-indexed row number in sheet
+        log.info(f"Row written for {user.get('name')} ({phone}) ref={txn_ref}: {row}")
         written += 1
 
-    return written, skipped
+    # Store the ref so a follow-up receipt photo can find these rows
+    if written > 0:
+        expires = datetime.datetime.now() + datetime.timedelta(hours=RECEIPT_REF_HOURS)
+        pending_receipt_refs[txn_ref] = {
+            "phone":       phone,
+            "sheet_name":  sheet_name,
+            "row_numbers": row_numbers,
+            "expires_at":  expires,
+        }
+        log.info(f"Stored pending receipt ref {txn_ref} → rows {row_numbers} in '{sheet_name}'")
+
+    return written, skipped, txn_ref
 
 # =====================================================================
 # 11b. SHEET HEADERS — Written on startup if missing
@@ -771,6 +947,8 @@ TRANSACTIONS_HEADERS = [
     "Activity Code",    # K
     "Type",             # L
     "Record Type",      # M
+    "Reference",        # N  ← batch transaction reference e.g. TXN-2026-0001
+    "Receipt Link",     # O  ← Google Drive link added when user attaches photo
 ]
 
 USERS_HEADERS = [
@@ -959,6 +1137,9 @@ def build_greeting(user: dict | None, phone: str = "") -> str:
 
 HELP_REPLY_STAFF = (
     "*What I can do for you:*\n\n"
+    "*Attaching a receipt:*\n"
+    "After saving a transaction you get a reference like *TXN-2026-0001*.\n"
+    "Send a photo of the receipt with that reference in the caption.\n\n"
     "*Log an expense*\n"
     "Just describe it naturally:\n"
     "  \"Spent 300,000 paying school fees for John at ABC Primary School\"\n"
@@ -994,13 +1175,16 @@ HELP_REPLY_ADMIN = (
 
 HELP_REPLY_MASTER = (
     "*Master commands:*\n\n"
-    "  Invoice  - create a new invoice/receipt for a client\n\n"
-    "Once started, follow the prompts:\n"
-    "  - Enter client name\n"
-    "  - Enter client address (or 'skip')\n"
-    "  - Add items as: description, amount\n"
+    "  Invoice       - Create a new invoice/receipt for a client\n"
+    "  Switch sheet  - Switch which org's sheet you are logging to\n"
+    "  Test mode     - Switch back to the test sheet (NGO_Grant_Ledger)\n\n"
+    "*Attaching receipts:*\n"
+    "After confirming a transaction you get a reference like *TXN-2026-0001*.\n"
+    "Send a photo with that reference in the caption to attach the receipt.\n\n"
+    "*Invoice flow:*\n"
+    "  - Enter client name, address, line items\n"
     "  - Type 'done' when finished\n"
-    "  - Review, then 'yes' to generate the PDF\n"
+    "  - Review, then 'yes' to generate PDF\n"
     "  - 'Edit' to fix something, 'Cancel' to discard\n"
 )
 
@@ -1409,7 +1593,96 @@ def handle_master_command(raw_text: str, phone: str) -> bool:
     Returns True if the message was handled here.
     Returns False to fall through (caller checks invoice flow next).
     """
+    global master_session_state, master_routing_state
     text_lower = raw_text.strip().lower()
+
+    # --- Responding to org-choice prompt ---
+    if master_routing_state.get("orgs"):
+        orgs = master_routing_state["orgs"]
+        test_sheet = accounting_config.get("ngo", {}).get("sheet_name", "NGO_Grant_Ledger")
+        # Accept a number
+        if text_lower.isdigit():
+            idx = int(text_lower) - 1
+            if idx == len(orgs):  # last option = test sheet
+                chosen_sheet = test_sheet
+                chosen_name  = "Test Sheet"
+            elif 0 <= idx < len(orgs):
+                chosen_sheet = orgs[idx]["sheet_name"]
+                chosen_name  = orgs[idx]["name"]
+            else:
+                send_whatsapp_reply(phone, f"Please reply with a number between 1 and {len(orgs) + 1}.")
+                return True
+
+            expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+            master_session_state = {
+                "sheet_name": chosen_sheet,
+                "org_name":   chosen_name,
+                "expires_at": expires,
+            }
+            master_routing_state = {}
+            send_whatsapp_reply(
+                phone,
+                f"Routing to *{chosen_name}* for the next {MASTER_SESSION_HOURS} hours.\n"
+                "Type *switch sheet* to change at any time.\n\n"
+                "Now send your transaction message."
+            )
+            return True
+        else:
+            # Not a number while in choosing state — re-prompt
+            lines = ["Please reply with a number to choose:\n"]
+            for i, org in enumerate(orgs, 1):
+                lines.append(f"  {i}. {org['name']}")
+            lines.append(f"  {len(orgs) + 1}. Test Sheet")
+            send_whatsapp_reply(phone, "\n".join(lines))
+            return True
+
+    # --- Switch sheet / test mode commands ---
+    if text_lower in MASTER_SWITCH_KEYWORDS:
+        master_session_state = {}  # clear current session
+        master_routing_state = {}
+        test_sheet = accounting_config.get("ngo", {}).get("sheet_name", "NGO_Grant_Ledger")
+
+        if "test" in text_lower:
+            # Jump straight to test sheet
+            expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+            master_session_state = {
+                "sheet_name": test_sheet,
+                "org_name":   "Test Sheet",
+                "expires_at": expires,
+            }
+            send_whatsapp_reply(phone, f"Switched to *Test Sheet* ({test_sheet}).")
+            return True
+
+        # Otherwise trigger the full choice flow
+        orgs = fetch_master_orgs()
+        if not orgs:
+            expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+            master_session_state = {
+                "sheet_name": test_sheet,
+                "org_name":   "Test Sheet",
+                "expires_at": expires,
+            }
+            send_whatsapp_reply(phone, "You are not registered with any org. Using Test Sheet.")
+            return True
+
+        if len(orgs) == 1:
+            expires = datetime.datetime.now() + datetime.timedelta(hours=MASTER_SESSION_HOURS)
+            master_session_state = {
+                "sheet_name": orgs[0]["sheet_name"],
+                "org_name":   orgs[0]["name"],
+                "expires_at": expires,
+            }
+            send_whatsapp_reply(phone, f"Switched to *{orgs[0]['name']}*.")
+            return True
+
+        # Multiple orgs — show choice
+        master_routing_state = {"orgs": orgs}
+        lines = ["Which sheet would you like to switch to?\n"]
+        for i, org in enumerate(orgs, 1):
+            lines.append(f"  {i}. {org['name']}")
+        lines.append(f"  {len(orgs) + 1}. Test Sheet")
+        send_whatsapp_reply(phone, "\n".join(lines))
+        return True
 
     if text_lower in INVOICE_TRIGGER_WORDS:
         prompt = inv.start_invoice_flow(phone)
@@ -1634,12 +1907,19 @@ def handle_command(raw_text: str, phone: str, user: dict | None) -> bool:
             return True
 
         pop_pending(phone)
-        written, skipped = write_batch_to_sheet(phone, batch, user)
+        written, skipped, txn_ref = write_batch_to_sheet(phone, batch, user)
         register_fingerprint(phone, fingerprint)
 
         reply_lines = [f"Saved! {written} transaction(s) recorded."]
         if skipped:
             reply_lines.append(f"({skipped} personal item(s) skipped.)")
+
+        # Include the reference number so user can attach a receipt photo
+        if txn_ref and written > 0:
+            reply_lines.append(
+                f"\nReference: *{txn_ref}*"
+                f"\nTo attach a receipt photo, send it with *{txn_ref}* in the caption."
+            )
 
         next_batch = peek_pending(phone)
         if next_batch:
@@ -1922,7 +2202,27 @@ def handle_incoming_whatsapp_message(raw_text: str, phone: str):
         return
 
     # --- Step 3: Block unregistered users from logging transactions ---
-    if not user:
+    # Master user is always allowed through — they may not be in the Users tab
+    # for every org they serve, so we resolve their sheet separately.
+    if MASTER_PHONE and phone == MASTER_PHONE:
+        sheet_name, needs_choice = get_master_active_sheet(phone)
+        if needs_choice:
+            # A prompt was sent asking master to choose an org — stop here
+            return
+        # Inject the resolved sheet into a synthetic user dict so the
+        # rest of the function (Gemini call, write_batch_to_sheet) works normally
+        if not user:
+            user = {
+                "name":           "Xan (Master)",
+                "entity_type":    DEFAULT_ENTITY_TYPE,
+                "role":           "admin",
+                "sheet_override": sheet_name,
+            }
+        else:
+            user = dict(user)  # copy so we don't mutate the cache
+            user["sheet_override"] = sheet_name
+
+    elif not user:
         send_whatsapp_reply(
             phone,
             "Sorry, your number is not registered in our system.\n\n"
@@ -1962,6 +2262,183 @@ Now process this message from {user.get('name', 'a staff member')}:
     call_gemini_with_retry(raw_text, phone, user, full_prompt, attempt=1)
 
 # =====================================================================
+# 15c. RECEIPT PHOTO HANDLING
+# =====================================================================
+
+def download_whatsapp_media(media_id: str) -> bytes | None:
+    """
+    Download media from WhatsApp using its media ID.
+    Two-step: first get the URL, then fetch the bytes.
+    Meta deletes media after 30 days so we download immediately.
+    """
+    try:
+        url_resp = requests.get(
+            f"https://graph.facebook.com/v19.0/{media_id}",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            verify=False, timeout=10
+        )
+        url_resp.raise_for_status()
+        media_url = url_resp.json().get("url")
+        if not media_url:
+            log.error("Media URL not returned by Meta.")
+            return None
+
+        media_resp = requests.get(
+            media_url,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            verify=False, timeout=30
+        )
+        media_resp.raise_for_status()
+        return media_resp.content
+    except Exception as e:
+        log.error(f"Failed to download WhatsApp media {media_id}: {e}")
+        return None
+
+
+def upload_receipt_to_drive_org(image_bytes: bytes, filename: str, folder_name: str) -> str | None:
+    """
+    Upload a receipt image to an org's Google Drive folder.
+    The folder must already exist and be shared with the service account.
+    Returns the shareable Drive link, or None on failure.
+    """
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+
+        creds         = gc_client.auth
+        drive_service = build("drive", "v3", credentials=creds)
+
+        # Find pre-existing shared folder
+        query   = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        folders = results.get("files", [])
+
+        if not folders:
+            log.warning(f"Drive folder '{folder_name}' not found. Trying root.")
+            folder_id = None
+        else:
+            folder_id = folders[0]["id"]
+
+        file_metadata = {"name": filename}
+        if folder_id:
+            file_metadata["parents"] = [folder_id]
+
+        media    = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg")
+        uploaded = drive_service.files().create(
+            body=file_metadata, media_body=media, fields="id"
+        ).execute()
+        file_id  = uploaded["id"]
+
+        drive_service.permissions().create(
+            fileId=file_id, body={"type": "anyone", "role": "reader"}
+        ).execute()
+
+        return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+
+    except Exception as e:
+        log.error(f"Failed to upload receipt to Drive: {e}")
+        return None
+
+
+def update_receipt_link_in_sheet(sheet_name: str, row_numbers: list[int], drive_link: str):
+    """Update column O (Receipt Link) for the specified rows in the sheet."""
+    try:
+        ws = gc_client.open(sheet_name).sheet1
+        for row_num in row_numbers:
+            ws.update_cell(row_num, 15, drive_link)  # Column O = 15
+        log.info(f"Receipt link set on rows {row_numbers} in '{sheet_name}'")
+    except Exception as e:
+        log.error(f"Failed to update receipt link in '{sheet_name}': {e}")
+
+
+def handle_receipt_photo(message: dict, sender_phone: str):
+    """
+    Process an incoming image message as a potential transaction receipt.
+
+    Flow:
+      1. Extract media ID and caption from the message
+      2. Look for a TXN reference in the caption (e.g. TXN-2026-0001)
+      3. If found: download image → upload to org Drive folder → update sheet rows
+      4. If not found: prompt user to resend with the reference in the caption
+    """
+    image_data = message.get("image", {})
+    media_id   = image_data.get("id", "")
+    caption    = image_data.get("caption", "").strip()
+
+    # Try to find a TXN reference in the caption
+    matches = RECEIPT_REF_PATTERN.findall(caption)
+    txn_ref = matches[0].upper() if matches else None
+
+    if not txn_ref:
+        send_whatsapp_reply(
+            sender_phone,
+            "I received your photo but could not find a transaction reference in the caption.\n\n"
+            "To attach a receipt, resend the photo with the transaction reference in the caption.\n"
+            "Example caption: *TXN-2026-0001*\n\n"
+            "(The reference was sent to you when you confirmed the transaction.)"
+        )
+        return
+
+    # Look up the ref
+    ref_info = pending_receipt_refs.get(txn_ref)
+
+    # Check expiry
+    if ref_info and datetime.datetime.now() > ref_info["expires_at"]:
+        del pending_receipt_refs[txn_ref]
+        ref_info = None
+
+    if not ref_info:
+        send_whatsapp_reply(
+            sender_phone,
+            f"I could not find reference *{txn_ref}*.\n\n"
+            "This may be because:\n"
+            "  - The reference has expired (references are valid for 48 hours)\n"
+            "  - The reference number was typed incorrectly\n\n"
+            "Please check the reference and try again."
+        )
+        return
+
+    # Download the image
+    send_whatsapp_reply(sender_phone, f"Got it! Attaching receipt to *{txn_ref}*...")
+    image_bytes = download_whatsapp_media(media_id)
+
+    if not image_bytes:
+        send_whatsapp_reply(
+            sender_phone,
+            "Sorry, I could not download the image from WhatsApp. Please try sending it again."
+        )
+        return
+
+    # Upload to the org's Drive folder (folder named after the sheet)
+    sheet_name  = ref_info["sheet_name"]
+    folder_name = sheet_name  # Drive folder should match the sheet name
+    filename    = f"{txn_ref}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+
+    drive_link = upload_receipt_to_drive_org(image_bytes, filename, folder_name)
+
+    if not drive_link:
+        send_whatsapp_reply(
+            sender_phone,
+            f"Receipt for *{txn_ref}* received, but could not be uploaded to Drive.\n\n"
+            "Please ensure a Google Drive folder named *exactly* the same as your "
+            f"sheet (*{sheet_name}*) exists and is shared with the service account."
+        )
+        return
+
+    # Update the sheet rows with the Drive link
+    update_receipt_link_in_sheet(sheet_name, ref_info["row_numbers"], drive_link)
+
+    # Clean up the pending ref
+    del pending_receipt_refs[txn_ref]
+
+    send_whatsapp_reply(
+        sender_phone,
+        f"Receipt attached to *{txn_ref}*!\n\n"
+        f"View: {drive_link}"
+    )
+
+
+# =====================================================================
 # 16. WEBHOOK ROUTE
 # =====================================================================
 @app.route("/webhook", methods=["GET", "POST"])
@@ -1996,23 +2473,31 @@ def webhook():
                 log.info(f"Duplicate message id {message_id} ignored.")
                 return jsonify({"status": "duplicate_ignored"}), 200
 
-            if message.get("type") != "text":
-                log.info(f"Non-text message type '{message.get('type')}' received. Ignored.")
-                return jsonify({"status": "ignored"}), 200
-
-            raw_text     = message["text"]["body"]
+            msg_type     = message.get("type")
             sender_phone = message["from"]
 
-            # --- Respond to Meta immediately, process in the background ---
-            # Meta expects a fast HTTP 200. If we make Gemini calls (which can
-            # take 15-45+ seconds during retries) before responding, Meta times
-            # out and redelivers the SAME message, causing duplicate processing.
-            # Handing off to a background thread lets us return 200 right away.
-            threading.Thread(
-                target=handle_incoming_whatsapp_message,
-                args=(raw_text, sender_phone),
-                daemon=True
-            ).start()
+            if msg_type == "text":
+                raw_text = message["text"]["body"]
+                # Respond to Meta immediately, process in background thread.
+                # This prevents Meta's 5-second timeout from triggering a
+                # redelivery (which was causing duplicate messages).
+                threading.Thread(
+                    target=handle_incoming_whatsapp_message,
+                    args=(raw_text, sender_phone),
+                    daemon=True
+                ).start()
+
+            elif msg_type == "image":
+                # Receipt photo — download and link to a transaction reference
+                threading.Thread(
+                    target=handle_receipt_photo,
+                    args=(message, sender_phone),
+                    daemon=True
+                ).start()
+
+            else:
+                log.info(f"Non-text/image message type '{msg_type}' received. Ignored.")
+                return jsonify({"status": "ignored"}), 200
 
         except (KeyError, IndexError, TypeError) as e:
             log.info(f"Unhandled payload structure: {e}. Ignored.")
@@ -2025,14 +2510,18 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health_check():
     registry = fetch_users_registry()
+    session = master_session_state
+    active_org = session.get("org_name", "none") if session.get("sheet_name") else "none"
     return jsonify({
-        "status":            "running",
-        "default_entity":    DEFAULT_ENTITY_TYPE,
-        "registered_users":  len(registry),
-        "pending_users":     len(pending_store),
-        "correcting_users":  len(correction_state),
-        "retry_queue_size":  sum(len(v) for v in retry_queue.values()),
-        "timestamp":         datetime.datetime.now().isoformat()
+        "status":                "running",
+        "default_entity":        DEFAULT_ENTITY_TYPE,
+        "registered_users":      len(registry),
+        "pending_users":         len(pending_store),
+        "correcting_users":      len(correction_state),
+        "retry_queue_size":      sum(len(v) for v in retry_queue.values()),
+        "master_active_org":     active_org,
+        "pending_receipt_refs":  len(pending_receipt_refs),
+        "timestamp":             datetime.datetime.now().isoformat()
     }), 200
 
 
