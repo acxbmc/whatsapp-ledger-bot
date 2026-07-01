@@ -566,7 +566,7 @@ class DriveFolderNotFound(Exception):
     pass
 
 
-def upload_pdf_to_drive(gc_client, local_path: str, drive_filename: str, folder_name: str = "ACX_Invoices") -> str:
+def upload_pdf_to_drive(gc_client, local_path: str, drive_filename: str, folder_name: str = "ACX_Invoices", creds=None) -> str:
     """
     Upload a PDF to Google Drive using the same service account credentials
     as gspread, share it as 'anyone with link can view', and return the link.
@@ -581,7 +581,8 @@ def upload_pdf_to_drive(gc_client, local_path: str, drive_filename: str, folder_
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
 
-    creds = gc_client.auth
+    # creds must be a valid google.oauth2 Credentials object,
+    # passed in from acx_bot.py's module-level google_cloud_creds
     drive_service = build("drive", "v3", credentials=creds)
 
     # Find the folder — do NOT create it (service account has no quota to do so)

@@ -1749,7 +1749,8 @@ def handle_invoice_flow_message(raw_text: str, phone: str) -> bool:
         pdf_link = ""
         try:
             pdf_link = inv.upload_pdf_to_drive(
-                gc_client, local_filename, f"{safe_invoice_num}.pdf"
+                gc_client, local_filename, f"{safe_invoice_num}.pdf",
+                creds=google_cloud_creds
             )
             log.info(f"Invoice {invoice_number} uploaded to Drive: {pdf_link}")
         except inv.DriveFolderNotFound as e:
@@ -2305,8 +2306,9 @@ def upload_receipt_to_drive_org(image_bytes: bytes, filename: str, folder_name: 
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
 
-        creds         = gc_client.auth
-        drive_service = build("drive", "v3", credentials=creds)
+        # Use the module-level google_cloud_creds directly —
+        # gc_client.auth does not exist in gspread 6.x
+        drive_service = build("drive", "v3", credentials=google_cloud_creds)
 
         # Find pre-existing shared folder
         query   = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
