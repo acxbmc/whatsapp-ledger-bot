@@ -2296,18 +2296,82 @@ def download_whatsapp_media(media_id: str) -> bytes | None:
         return None
 
 
+def forward_receipt_to_master(
+    image_bytes: bytes,
+    filename: str,
+    txn_ref: str,
+    sender_name: str,
+    sender_phone: str,
+) -> bool:
+    """
+    Forward a receipt image to the master phone via WhatsApp.
+    This sidesteps the Google Drive service account storage quota issue entirely
+    (service accounts have 0 quota on personal Drive).
+    Returns True on success.
+    """
+    if not MASTER_PHONE:
+        log.warning("MASTER_PHONE not set — cannot forward receipt.")
+        return False
+
+    try:
+        # Step 1: Upload image to WhatsApp Media API to get a media_id
+        upload_url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/media"
+        headers    = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+        files      = {"file": (filename, image_bytes, "image/jpeg")}
+        data       = {"messaging_product": "whatsapp", "type": "image/jpeg"}
+
+        r = requests.post(
+            upload_url, headers=headers, files=files, data=data,
+            timeout=30, verify=False
+        )
+        r.raise_for_status()
+        media_id = r.json().get("id")
+
+        if not media_id:
+            log.error("Media upload for receipt archive returned no media_id.")
+            return False
+
+        # Step 2: Send the image to the master phone with TXN reference in caption
+        send_url  = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
+        caption   = (
+            f"Receipt for *{txn_ref}*\n"
+            f"From: {sender_name} ({sender_phone})\n"
+            f"Received: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+        payload   = {
+            "messaging_product": "whatsapp",
+            "to":   MASTER_PHONE,
+            "type": "image",
+            "image": {"id": media_id, "caption": caption}
+        }
+        r2 = requests.post(
+            send_url,
+            headers={**headers, "Content-Type": "application/json"},
+            json=payload, timeout=15, verify=False
+        )
+        r2.raise_for_status()
+        log.info(f"Receipt {txn_ref} forwarded to master {MASTER_PHONE}.")
+        return True
+
+    except Exception as e:
+        log.error(f"Failed to forward receipt to master: {e}")
+        return False
+
+
 def upload_receipt_to_drive_org(image_bytes: bytes, filename: str, folder_name: str) -> str | None:
     """
     Upload a receipt image to an org's Google Drive folder.
-    The folder must already exist and be shared with the service account.
+    NOTE: This requires the folder to be on a Google Shared Drive (Google Workspace)
+    because service accounts have 0 storage quota on personal Google Drive.
+    If you are on personal Gmail, this will fail with storageQuotaExceeded —
+    use forward_receipt_to_master() instead (see handle_receipt_photo).
     Returns the shareable Drive link, or None on failure.
     """
     try:
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
 
-        # Use the module-level google_cloud_creds directly —
-        # gc_client.auth does not exist in gspread 6.x
+        # gc_client.auth does not exist in gspread 6.x — use module-level creds
         drive_service = build("drive", "v3", credentials=google_cloud_creds)
 
         # Find pre-existing shared folder
@@ -2316,20 +2380,16 @@ def upload_receipt_to_drive_org(image_bytes: bytes, filename: str, folder_name: 
         folders = results.get("files", [])
 
         if not folders:
-            log.warning(f"Drive folder '{folder_name}' not found. Trying root.")
-            folder_id = None
-        else:
-            folder_id = folders[0]["id"]
+            log.warning(f"Drive folder '{folder_name}' not found.")
+            return None
+        folder_id = folders[0]["id"]
 
-        file_metadata = {"name": filename}
-        if folder_id:
-            file_metadata["parents"] = [folder_id]
-
+        file_metadata = {"name": filename, "parents": [folder_id]}
         media    = MediaIoBaseUpload(io.BytesIO(image_bytes), mimetype="image/jpeg")
         uploaded = drive_service.files().create(
             body=file_metadata, media_body=media, fields="id"
         ).execute()
-        file_id  = uploaded["id"]
+        file_id = uploaded["id"]
 
         drive_service.permissions().create(
             fileId=file_id, body={"type": "anyone", "role": "reader"}
@@ -2411,33 +2471,51 @@ def handle_receipt_photo(message: dict, sender_phone: str):
         )
         return
 
-    # Upload to the org's Drive folder (folder named after the sheet)
+    # Upload to the org's Drive folder — try first, fall back to WhatsApp archive
     sheet_name  = ref_info["sheet_name"]
-    folder_name = sheet_name  # Drive folder should match the sheet name
+    folder_name = sheet_name
     filename    = f"{txn_ref}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
 
     drive_link = upload_receipt_to_drive_org(image_bytes, filename, folder_name)
 
-    if not drive_link:
+    if drive_link:
+        # Drive upload succeeded
+        update_receipt_link_in_sheet(sheet_name, ref_info["row_numbers"], drive_link)
+        del pending_receipt_refs[txn_ref]
         send_whatsapp_reply(
             sender_phone,
-            f"Receipt for *{txn_ref}* received, but could not be uploaded to Drive.\n\n"
-            "Please ensure a Google Drive folder named *exactly* the same as your "
-            f"sheet (*{sheet_name}*) exists and is shared with the service account."
+            f"Receipt attached to *{txn_ref}*!\n\n"
+            f"View: {drive_link}"
         )
-        return
+    else:
+        # Drive failed (likely storage quota) — forward to master WhatsApp instead
+        log.warning(f"Drive upload failed for {txn_ref} — forwarding to master WhatsApp.")
 
-    # Update the sheet rows with the Drive link
-    update_receipt_link_in_sheet(sheet_name, ref_info["row_numbers"], drive_link)
+        # Get sender name from user registry if possible
+        sender_user  = get_user(sender_phone)
+        sender_name  = sender_user.get("name", sender_phone) if sender_user else sender_phone
 
-    # Clean up the pending ref
-    del pending_receipt_refs[txn_ref]
+        archived = forward_receipt_to_master(
+            image_bytes, filename, txn_ref, sender_name, sender_phone
+        )
 
-    send_whatsapp_reply(
-        sender_phone,
-        f"Receipt attached to *{txn_ref}*!\n\n"
-        f"View: {drive_link}"
-    )
+        archive_note = f"Archived to master WhatsApp on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        update_receipt_link_in_sheet(sheet_name, ref_info["row_numbers"], archive_note)
+        del pending_receipt_refs[txn_ref]
+
+        if archived:
+            send_whatsapp_reply(
+                sender_phone,
+                f"Receipt for *{txn_ref}* received and saved.\n\n"
+                "(Stored in the admin's archive — Drive storage is not available "
+                "for service accounts on personal Google accounts.)"
+            )
+        else:
+            send_whatsapp_reply(
+                sender_phone,
+                f"Receipt for *{txn_ref}* received but could not be stored automatically.\n\n"
+                "Please send it directly to your administrator for manual filing."
+            )
 
 
 # =====================================================================
