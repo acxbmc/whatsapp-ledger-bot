@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 import urllib3
 
 import invoice_module as inv
+import requisition_module as req
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -231,6 +232,17 @@ def get_user_sheet(user: dict) -> any:
     return gc_client.open(sheet_name).sheet1
 
 
+def get_user_sheet_name(user: dict) -> str:
+    """Same resolution as get_user_sheet() but returns just the sheet name string."""
+    entity_type = user["entity_type"]
+    if user.get("sheet_override"):
+        return user["sheet_override"]
+    return accounting_config.get(entity_type, {}).get(
+        "sheet_name",
+        accounting_config[DEFAULT_ENTITY_TYPE]["sheet_name"]
+    )
+
+
 def invalidate_users_cache():
     """Force a fresh fetch next time get_user() is called."""
     global _users_cache_time
@@ -319,7 +331,6 @@ def get_master_active_sheet(phone: str) -> tuple[str | None, bool]:
             phone,
             f"Routing to *{orgs[0]['name']}* for the next {MASTER_SESSION_HOURS} hours.\n"
             "Type *switch sheet* to change at any time."
-            "Type *switch sheet* to change at any time."
         )
         return (orgs[0]["sheet_name"], False)
 
@@ -332,6 +343,41 @@ def get_master_active_sheet(phone: str) -> tuple[str | None, bool]:
     lines.append("\nReply with the number.")
     send_whatsapp_reply(phone, "\n".join(lines))
     return (None, True)
+
+
+def resolve_sender(phone: str) -> tuple[dict | None, str | None, bool]:
+    """
+    Unified resolver used by both the transaction flow and the requisition flow.
+
+    Returns (user, sheet_name, needs_choice):
+      - Regular registered user  → (user_dict, their_sheet_name, False)
+      - Master, single/no org    → (synthetic_user, resolved_sheet_name, False)
+      - Master, multiple orgs,
+        no choice made yet       → (None, None, True) — a prompt was already sent
+      - Unregistered, non-master → (None, None, False) — caller should reject
+    """
+    user = get_user(phone)
+
+    if MASTER_PHONE and phone == MASTER_PHONE:
+        sheet_name, needs_choice = get_master_active_sheet(phone)
+        if needs_choice:
+            return (None, None, True)
+        if not user:
+            user = {
+                "name":           "Xan (Master)",
+                "entity_type":    DEFAULT_ENTITY_TYPE,
+                "role":           "admin",
+                "sheet_override": sheet_name,
+            }
+        else:
+            user = dict(user)
+            user["sheet_override"] = sheet_name
+        return (user, sheet_name, False)
+
+    if not user:
+        return (None, None, False)
+
+    return (user, get_user_sheet_name(user), False)
 
 # =====================================================================
 # 4. LEARN FROM CORRECTIONS — Store corrections to improve future prompts
@@ -433,6 +479,16 @@ GREETING_KEYWORDS = {"hi", "hello", "hey", "good morning", "good afternoon",
                      "good evening", "hie", "howdy", "greetings"}
 HELP_KEYWORDS     = {"help", "/help", "what can you do", "commands",
                      "menu", "options", "guide", "how does this work"}
+
+# Requisition flow triggers
+REQ_TRIGGER_KEYWORDS = {"req", "requisition", "request", "purchase request", "new req"}
+
+# Admin requisition-management keywords (exact match)
+PENDING_LIST_KEYWORDS   = {"pending", "/pending"}
+APPROVED_LIST_KEYWORDS  = {"approved", "/approved"}
+RECEIPTED_LIST_KEYWORDS = {"receipted", "/receipted"}
+REJECTED_LIST_KEYWORDS  = {"rejected", "/rejected"}
+SUMMARY_KEYWORDS        = {"summary", "/summary"}
 
 # Admin command prefixes (case-insensitive, matched against lowercased text)
 ADDUSER_PREFIX    = "adduser "
@@ -566,8 +622,37 @@ class MultiTransactionRequest(BaseModel):
 # =====================================================================
 _coa_cache: dict = {}
 
+def has_coa_tab(entity_type: str) -> bool:
+    """
+    Check whether a CoA_Reference tab actually exists for this entity.
+    For-profit orgs don't require a CoA — it's optional.
+    """
+    sheet_name = accounting_config.get(entity_type, {}).get("sheet_name", "")
+    if not sheet_name:
+        return False
+    try:
+        gc_client.open(sheet_name).worksheet("CoA_Reference")
+        return True
+    except Exception:
+        return False
+
+
 def fetch_coa_rules(entity_type: str) -> list[str]:
+    """
+    Fetch Chart of Accounts rules from the CoA_Reference tab.
+
+    For-profit orgs: CoA is OPTIONAL. If no CoA_Reference tab exists,
+    returns an empty list (Gemini will use free-form categorisation).
+    If a tab DOES exist for a for-profit org, it is used just like NGO.
+
+    NGO orgs: CoA is required. An empty result is logged as a warning.
+    """
     global _coa_cache
+
+    # For-profit without a CoA tab — skip entirely, no error
+    if entity_type == "for-profit" and not has_coa_tab(entity_type):
+        return []
+
     cache_entry = _coa_cache.get(entity_type)
     if cache_entry:
         cached_time, cached_rules = cache_entry
@@ -617,12 +702,42 @@ def add_coa_entry(entity_type: str, category: str, activity_code: str) -> bool:
 
 
 def build_coa_context(entity_type: str) -> str:
+    """
+    Build the Chart of Accounts section of the Gemini prompt.
+
+    For-profit without a CoA tab: returns a simple free-form prompt —
+    no strict account mapping required, Gemini uses best judgment.
+    For-profit WITH a CoA tab: treated exactly like NGO (optional but respected).
+    NGO: full strict CoA enforcement.
+    """
     rules = fetch_coa_rules(entity_type)
+
+    # For-profit with no CoA — light-touch prompt, no strict mapping
+    if entity_type == "for-profit" and not rules:
+        return """
+*** CATEGORISATION (FOR-PROFIT MODE — NO STRICT CHART OF ACCOUNTS) ***
+This organisation has not provided a Chart of Accounts.
+Use your best judgment to classify transactions:
+  - category:      A broad business category (e.g. "Sales Revenue", "Staff Costs",
+                   "Office Expenses", "Purchases", "Transport", "Utilities")
+  - activity_code: A short descriptive label for the specific item
+                   (e.g. "Salary - John", "Airtime", "Fuel", "Stock Purchase")
+
+CASH FLOW RULES:
+  - Revenue from sales / services → type = "Income"
+  - Owner injecting personal funds → type = "Capital Investment"
+  - Business spending / expenses   → type = "Expense"
+  - Owner withdrawing cash         → type = "Drawings"
+================================================================
+"""
+
+    # NGO or for-profit WITH a provided CoA — strict mapping
     if not rules:
         return (
             "*** CHART OF ACCOUNTS: Not available. Use best judgment. ***\n"
             "If unsure: Account '9999 - Unassigned/Review', Activity 'UNCATEGORIZED'."
         )
+
     rules_text = "\n    ".join(rules)
     return f"""
 *** STRICT CHART OF ACCOUNTS - USE THESE EXACTLY ***
@@ -893,23 +1008,48 @@ def write_batch_to_sheet(phone: str, batch: dict, user: dict) -> tuple[int, int,
         current_count = len(target_sheet.get_all_values())
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = [
-            timestamp,
-            phone,
-            user.get("name", "Unknown"),
-            primary_activity,
-            item["purpose"],
-            item["line_item"],
-            item["amount"],
-            item["who"],
-            item["location"],
-            item["category"],
-            item["activity_code"],
-            item["type"],
-            item["record_type"],
-            txn_ref,   # N: Reference
-            "",        # O: Receipt Link (filled later when photo arrives)
-        ]
+        amount    = item["amount"]
+        tx_type   = item["type"]
+
+        if entity_type == "for-profit":
+            # For-profit layout: Cash In / Cash Out split instead of a single Amount column.
+            # Cash In  = money entering the business (Income, Capital Investment)
+            # Cash Out = money leaving the business (Expense, Drawings)
+            cash_in  = amount if tx_type in ("Income", "Capital Investment") else ""
+            cash_out = amount if tx_type in ("Expense", "Drawings")          else ""
+            row = [
+                timestamp,                  # A: Timestamp
+                phone,                      # B: Phone Number
+                user.get("name", "Unknown"),# C: Staff Name
+                item["purpose"],            # D: Purpose
+                item["line_item"],          # E: Line Item
+                cash_in,                    # F: Cash In
+                cash_out,                   # G: Cash Out
+                item["who"],                # H: Who
+                tx_type,                    # I: Type
+                item["record_type"],        # J: Record Type
+                txn_ref,                    # K: Reference
+            ]
+        else:
+            # NGO layout: all columns including Primary Activity, Location, Category, Activity Code
+            row = [
+                timestamp,                  # A: Timestamp
+                phone,                      # B: Phone
+                user.get("name", "Unknown"),# C: Staff Name
+                primary_activity,           # D: Primary Activity
+                item["purpose"],            # E: Purpose
+                item["line_item"],          # F: Line Item
+                amount,                     # G: Amount
+                item["who"],                # H: Who
+                item["location"],           # I: Location
+                item["category"],           # J: Category
+                item["activity_code"],      # K: Activity Code
+                tx_type,                    # L: Type
+                item["record_type"],        # M: Record Type
+                txn_ref,                    # N: Reference
+                "",                         # O: Receipt Link
+            ]
+
         target_sheet.append_row(row)
         row_numbers.append(current_count + 1)  # 1-indexed row number in sheet
         log.info(f"Row written for {user.get('name')} ({phone}) ref={txn_ref}: {row}")
@@ -949,6 +1089,21 @@ TRANSACTIONS_HEADERS = [
     "Record Type",      # M
     "Reference",        # N  ← batch transaction reference e.g. TXN-2026-0001
     "Receipt Link",     # O  ← Google Drive link added when user attaches photo
+]
+
+# For-profit column layout — simpler than NGO, uses Cash In / Cash Out split
+FOR_PROFIT_TRANSACTIONS_HEADERS = [
+    "Timestamp",        # A
+    "Phone Number",     # B
+    "Staff Name",       # C
+    "Purpose",          # D
+    "Line Item",        # E
+    "Cash In",          # F  ← Income, Capital Investment
+    "Cash Out",         # G  ← Expense, Drawings
+    "Who",              # H
+    "Type",             # I
+    "Record Type",      # J
+    "Reference",        # K
 ]
 
 USERS_HEADERS = [
@@ -1035,7 +1190,13 @@ def ensure_all_headers():
             workbook = gc_client.open(sheet_name)
 
             # Main transactions sheet (Sheet1)
-            ensure_headers(workbook.sheet1, TRANSACTIONS_HEADERS)
+            # For-profit uses a different column layout than NGO
+            tx_headers = (
+                FOR_PROFIT_TRANSACTIONS_HEADERS
+                if entity_type == "for-profit"
+                else TRANSACTIONS_HEADERS
+            )
+            ensure_headers(workbook.sheet1, tx_headers)
 
             # Users tab
             try:
@@ -1052,16 +1213,53 @@ def ensure_all_headers():
                 log.warning(f"'{CORRECTIONS_TAB_NAME}' tab not found in '{sheet_name}'. Create it manually.")
 
             # CoA_Reference tab — headers only, don't touch data
+            # For-profit: CoA is optional, so missing tab is not a warning
             try:
                 coa_ws = workbook.worksheet("CoA_Reference")
                 ensure_headers(coa_ws, COA_HEADERS)
             except gspread.exceptions.WorksheetNotFound:
-                log.warning(f"'CoA_Reference' tab not found in '{sheet_name}'.")
+                if entity_type == "for-profit":
+                    log.info(f"No CoA_Reference tab in '{sheet_name}' (for-profit — optional, skipping).")
+                else:
+                    log.warning(f"'CoA_Reference' tab not found in '{sheet_name}'.")
+
+            # Requisitions tab — create if missing (bot writes here, not the admin)
+            try:
+                req_ws = workbook.worksheet(req.REQUISITIONS_TAB_NAME)
+            except gspread.exceptions.WorksheetNotFound:
+                req_ws = workbook.add_worksheet(
+                    title=req.REQUISITIONS_TAB_NAME, rows=1000, cols=len(req.REQUISITIONS_HEADERS)
+                )
+                log.info(f"'{req.REQUISITIONS_TAB_NAME}' tab created in '{sheet_name}'.")
+            ensure_headers(req_ws, req.REQUISITIONS_HEADERS)
 
             log.info(f"Header check complete for '{sheet_name}'.")
 
         except Exception as e:
             log.error(f"Could not open sheet '{sheet_name}' for header check: {e}")
+
+    # --- Per-org sheets (sheet_override in the Users tab) ---
+    # Each client org has its own sheet, created manually by the admin. We only
+    # ensure the Requisitions tab exists there — the transactions/CoA layout is
+    # set up by whoever created the sheet.
+    try:
+        registry = fetch_users_registry()
+        org_sheets = {u["sheet_override"] for u in registry.values() if u.get("sheet_override")}
+        for org_sheet_name in org_sheets:
+            try:
+                org_workbook = gc_client.open(org_sheet_name)
+                try:
+                    org_req_ws = org_workbook.worksheet(req.REQUISITIONS_TAB_NAME)
+                except gspread.exceptions.WorksheetNotFound:
+                    org_req_ws = org_workbook.add_worksheet(
+                        title=req.REQUISITIONS_TAB_NAME, rows=1000, cols=len(req.REQUISITIONS_HEADERS)
+                    )
+                    log.info(f"'{req.REQUISITIONS_TAB_NAME}' tab created in org sheet '{org_sheet_name}'.")
+                ensure_headers(org_req_ws, req.REQUISITIONS_HEADERS)
+            except Exception as e:
+                log.error(f"Could not ensure Requisitions tab in org sheet '{org_sheet_name}': {e}")
+    except Exception as e:
+        log.error(f"Could not scan org sheets for Requisitions tab setup: {e}")
 
     # --- Master_Users sheet (your own business invoicing) ---
     if MASTER_PHONE:
@@ -1124,8 +1322,8 @@ def build_greeting(user: dict | None, phone: str = "") -> str:
             f"Hello {user['name']}! Welcome back to the Ledger Bot.\n\n"
             f"You are registered as *{user['role'].title()}* "
             f"on the *{user['entity_type'].upper()}* account.\n\n"
-            "Just describe what you spent and I will handle the rest. "
-            "Type *help* to see everything I can do."
+            "Type *req* to submit a requisition, or describe an expense "
+            "directly. Type *help* to see everything I can do."
         )
     return (
         "Hello! Welcome to the Ledger Bot.\n\n"
@@ -1137,11 +1335,14 @@ def build_greeting(user: dict | None, phone: str = "") -> str:
 
 HELP_REPLY_STAFF = (
     "*What I can do for you:*\n\n"
-    "*Attaching a receipt:*\n"
-    "After saving a transaction you get a reference like *TXN-2026-0001*.\n"
-    "Send a photo of the receipt with that reference in the caption.\n\n"
-    "*Log an expense*\n"
-    "Just describe it naturally:\n"
+    "*Submit a requisition* (recommended)\n"
+    "  Req        - Start a new requisition\n"
+    "  Follow the prompts: pick account, add items, submit\n"
+    "  Your Admin will approve or reject it\n\n"
+    "*After approval:*\n"
+    "  Send a photo of your receipt with the reference "
+    "(e.g. *REQ-2026-0001*) in the caption\n\n"
+    "*Log an expense directly* (no approval needed)\n"
     "  \"Spent 300,000 paying school fees for John at ABC Primary School\"\n"
     "  \"Bought soap 20,000 and vaseline 3,000\"\n\n"
     "*After I show you a summary:*\n"
@@ -1151,26 +1352,27 @@ HELP_REPLY_STAFF = (
     "*Other commands:*\n"
     "  Balance    - See your total income and expenses\n"
     "  Undo       - Delete your last saved entry\n"
-    "  Help       - Show this menu\n\n"
-    "Send me a transaction message to get started!"
+    "  Help       - Show this menu"
 )
 
 HELP_REPLY_ADMIN = (
-    "*What I can do for you:*\n\n"
-    "*Log an expense*\n"
-    "Just describe it naturally:\n"
-    "  \"Spent 300,000 paying school fees for John at ABC Primary School\"\n\n"
-    "*After I show you a summary:*\n"
-    "  Yes / No / Correct\n\n"
-    "*Staff commands:*\n"
-    "  Balance    - your income and expense totals\n"
-    "  Undo       - delete your last entry\n\n"
-    "*Admin commands:*\n"
+    "*Admin commands:*\n\n"
+    "*Requisitions:*\n"
+    "  Pending           - List requisitions awaiting your approval\n"
+    "  Approved          - List approved, not yet receipted\n"
+    "  Receipted         - List completed requisitions\n"
+    "  Rejected          - List rejected requisitions\n"
+    "  Summary           - Spending totals by account\n"
+    "  View REQ-XXXX     - See full detail of one requisition\n"
+    "  Approve REQ-XXXX  - Approve a pending requisition\n"
+    "  Reject REQ-XXXX [reason] - Reject with an optional reason\n\n"
+    "*User management:*\n"
     "  adduser <phone> <name> <role>  - Add a new user\n"
     "  removeuser <phone>             - Deactivate a user\n"
     "  listusers                      - See all active users\n\n"
-    "Example:\n"
-    "  adduser 256700123456 Jane Apio staff"
+    "Example: adduser 256700123456 Jane Apio staff\n\n"
+    "You can also submit your own requisition with *req*, or log an "
+    "expense directly the same way staff do."
 )
 
 HELP_REPLY_MASTER = (
@@ -1178,9 +1380,6 @@ HELP_REPLY_MASTER = (
     "  Invoice       - Create a new invoice/receipt for a client\n"
     "  Switch sheet  - Switch which org's sheet you are logging to\n"
     "  Test mode     - Switch back to the test sheet (NGO_Grant_Ledger)\n\n"
-    "*Attaching receipts:*\n"
-    "After confirming a transaction you get a reference like *TXN-2026-0001*.\n"
-    "Send a photo with that reference in the caption to attach the receipt.\n\n"
     "*Invoice flow:*\n"
     "  - Enter client name, address, line items\n"
     "  - Type 'done' when finished\n"
@@ -1313,9 +1512,12 @@ def apply_correction(phone: str, raw_text: str, user: dict | None) -> bool:
         # --- If the Account Name or Activity Code was corrected, make sure ---
         # --- this classification exists in the Chart of Accounts. If it   ---
         # --- doesn't, add it now so future messages recognise it too.     ---
+        # --- For-profit without a CoA: skip this entirely.                ---
         coa_note = ""
         entity_type = user["entity_type"] if user else DEFAULT_ENTITY_TYPE
-        if field in ("category", "activity_code"):
+        if field in ("category", "activity_code") and not (
+            entity_type == "for-profit" and not has_coa_tab(entity_type)
+        ):
             if not coa_pair_exists(entity_type, t["category"], t["activity_code"]):
                 added = add_coa_entry(entity_type, t["category"], t["activity_code"])
                 if added:
@@ -1820,6 +2022,230 @@ def handle_invoice_flow_message(raw_text: str, phone: str) -> bool:
 
 
 # =====================================================================
+# 13d. REQUISITION WORKFLOW — structured, no AI required
+# =====================================================================
+
+def process_requisition_flow_message(phone: str, raw_text: str) -> bool:
+    """Advance an in-progress requisition. On completion, submit + notify admins."""
+    reply_text, completed = req.process_requisition_message(phone, raw_text)
+
+    if completed is None:
+        send_whatsapp_reply(phone, reply_text)
+        return True
+
+    send_whatsapp_reply(phone, reply_text)  # "Processing your requisition..."
+
+    sheet_name  = completed.get("_sheet_name")
+    staff_name  = completed.get("_user_name", phone)
+    entity_type = completed.get("_entity_type", DEFAULT_ENTITY_TYPE)
+
+    if not sheet_name:
+        log.error(f"Requisition completed for {phone} with no sheet_name — cannot submit.")
+        send_whatsapp_reply(phone, "Something went wrong submitting your requisition. Please try *req* again.")
+        return True
+
+    try:
+        req_number = req.submit_requisition(gc_client, sheet_name, phone, staff_name, completed)
+    except Exception as e:
+        log.error(f"Failed to submit requisition for {phone}: {e}")
+        send_whatsapp_reply(phone, "Something went wrong submitting your requisition. Please try *req* again.")
+        return True
+
+    total = sum(i["total"] for i in completed["items"])
+    send_whatsapp_reply(
+        phone,
+        f"Requisition submitted!\n\n"
+        f"Reference: *{req_number}*\n"
+        f"Total: UGX {total:,}\n\n"
+        "You will be notified once your Admin reviews it."
+    )
+
+    # Notify all admins for this org
+    base_sheet_name = accounting_config.get("ngo", {}).get("sheet_name", "NGO_Grant_Ledger")
+    admins = req.get_org_admins(gc_client, base_sheet_name, USERS_TAB_NAME, entity_type, sheet_name)
+    cat = completed["selected_category"]
+    cat_label = cat.split(" - ", 1)[-1] if " - " in cat else cat
+
+    for admin_phone in admins:
+        if admin_phone == phone:
+            continue
+        send_whatsapp_reply(
+            admin_phone,
+            f"New requisition from {staff_name}:\n"
+            f"*{req_number}* — {cat_label}\n"
+            f"Total: UGX {total:,}\n\n"
+            "Reply:\n"
+            f"  approve {req_number}\n"
+            f"  reject {req_number} [reason]\n"
+            f"  view {req_number}"
+        )
+
+    return True
+
+
+def _require_admin(phone: str, user: dict | None) -> tuple:
+    """
+    Gate a command to admins only (or the master user).
+    Returns (ok, resolved_user, sheet_name). Sends a denial/prompt message if not ok.
+    """
+    resolved_user, sheet_name, needs_choice = resolve_sender(phone)
+    if needs_choice:
+        return (False, None, None)   # org-choice prompt already sent
+    if not resolved_user:
+        send_whatsapp_reply(phone, "You are not registered. Contact your administrator.")
+        return (False, None, None)
+    is_admin = resolved_user.get("role") == "admin" or (MASTER_PHONE and phone == MASTER_PHONE)
+    if not is_admin:
+        send_whatsapp_reply(phone, "Sorry, this command is only available to admins.")
+        return (False, None, None)
+    return (True, resolved_user, sheet_name)
+
+
+def handle_approve_command(phone: str, user: dict | None, req_number: str) -> bool:
+    ok, resolved_user, sheet_name = _require_admin(phone, user)
+    if not ok:
+        return True
+    success, data = req.approve_requisition(gc_client, sheet_name, req_number, resolved_user.get("name", phone))
+    if not success:
+        send_whatsapp_reply(phone, data["error"])
+        return True
+
+    try:
+        total_int = int(str(data["total"]).replace(",", ""))
+    except (ValueError, TypeError):
+        total_int = 0
+
+    send_whatsapp_reply(
+        phone,
+        f"Approved *{data['req_number']}* for {data['staff_name']}.\n"
+        f"Total: UGX {total_int:,}"
+    )
+
+    items_lines = "\n".join(
+        f"  {it['name']}: {it['qty']} x {it.get('unit_price', 0):,} = UGX {it.get('total', 0):,}"
+        for it in data.get("items", [])
+    )
+    send_whatsapp_reply(
+        data["staff_phone"],
+        f"Your requisition *{data['req_number']}* has been approved!\n\n"
+        f"{items_lines}\n\n"
+        f"Total: UGX {total_int:,}\n\n"
+        "Please proceed with the purchase. Once done, send a photo of the receipt "
+        f"with *{data['req_number']}* in the caption."
+    )
+    return True
+
+
+def handle_reject_command(phone: str, user: dict | None, req_number: str, reason: str) -> bool:
+    ok, resolved_user, sheet_name = _require_admin(phone, user)
+    if not ok:
+        return True
+    success, data = req.reject_requisition(gc_client, sheet_name, req_number, resolved_user.get("name", phone), reason)
+    if not success:
+        send_whatsapp_reply(phone, data["error"])
+        return True
+
+    send_whatsapp_reply(phone, f"Rejected *{data['req_number']}*.")
+    reason_txt = f"\nReason: {reason}" if reason else ""
+    send_whatsapp_reply(
+        data["staff_phone"],
+        f"Your requisition *{data['req_number']}* was not approved.{reason_txt}\n\n"
+        "Contact your administrator for details, or submit a new requisition with *req*."
+    )
+    return True
+
+
+def handle_req_list_command(phone: str, user: dict | None, status_filter: str, title: str) -> bool:
+    ok, resolved_user, sheet_name = _require_admin(phone, user)
+    if not ok:
+        return True
+    results = req.list_requisitions(gc_client, sheet_name, status_filter=status_filter)
+    send_whatsapp_reply(phone, req.format_req_list(results, title))
+    return True
+
+
+def handle_summary_command(phone: str, user: dict | None) -> bool:
+    ok, resolved_user, sheet_name = _require_admin(phone, user)
+    if not ok:
+        return True
+    send_whatsapp_reply(phone, req.get_spending_summary(gc_client, sheet_name))
+    return True
+
+
+def handle_view_command(phone: str, user: dict | None, req_number: str) -> bool:
+    ok, resolved_user, sheet_name = _require_admin(phone, user)
+    if not ok:
+        return True
+    detail = req.get_requisition_detail(gc_client, sheet_name, req_number)
+    if not detail:
+        send_whatsapp_reply(phone, f"*{req_number}* not found.")
+        return True
+    send_whatsapp_reply(phone, req.format_req_detail(detail))
+    return True
+
+
+def handle_requisition_command(raw_text: str, phone: str, user: dict | None) -> bool:
+    """
+    Routes all requisition-related messages. Returns True if handled.
+    Called from handle_command() before the general command keywords.
+    """
+    text_lower    = raw_text.strip().lower()
+    text_stripped = raw_text.strip()
+
+    # In-progress requisition flow takes top priority
+    if req.is_in_requisition_flow(phone):
+        return process_requisition_flow_message(phone, raw_text)
+
+    # Start a new requisition
+    if text_lower in REQ_TRIGGER_KEYWORDS:
+        resolved_user, sheet_name, needs_choice = resolve_sender(phone)
+        if needs_choice:
+            return True
+        if not resolved_user:
+            send_whatsapp_reply(
+                phone,
+                "Sorry, your number is not registered. Contact your administrator to be added."
+            )
+            return True
+        entity_type = resolved_user["entity_type"]
+        coa_rules   = fetch_coa_rules(entity_type)
+        prompt      = req.start_requisition(phone, coa_rules)
+        req.requisition_state[phone]["_sheet_name"]  = sheet_name
+        req.requisition_state[phone]["_user_name"]   = resolved_user.get("name", phone)
+        req.requisition_state[phone]["_entity_type"] = entity_type
+        send_whatsapp_reply(phone, prompt)
+        return True
+
+    # Approve / Reject (admin)
+    m = req.APPROVE_PATTERN.match(text_stripped)
+    if m:
+        return handle_approve_command(phone, user, m.group(1).upper())
+
+    m = req.REJECT_PATTERN.match(text_stripped)
+    if m:
+        return handle_reject_command(phone, user, m.group(1).upper(), (m.group(2) or "").strip())
+
+    # Listing / summary (admin)
+    if text_lower in PENDING_LIST_KEYWORDS:
+        return handle_req_list_command(phone, user, req.STATUS_PENDING, "Pending Requisitions")
+    if text_lower in APPROVED_LIST_KEYWORDS:
+        return handle_req_list_command(phone, user, req.STATUS_APPROVED, "Approved — Awaiting Receipt")
+    if text_lower in RECEIPTED_LIST_KEYWORDS:
+        return handle_req_list_command(phone, user, req.STATUS_RECEIPTED, "Receipted Requisitions")
+    if text_lower in REJECTED_LIST_KEYWORDS:
+        return handle_req_list_command(phone, user, req.STATUS_REJECTED, "Rejected Requisitions")
+    if text_lower in SUMMARY_KEYWORDS:
+        return handle_summary_command(phone, user)
+
+    # View / status (admin)
+    m = req.VIEW_PATTERN.match(text_stripped) or req.STATUS_PATTERN.match(text_stripped)
+    if m:
+        return handle_view_command(phone, user, m.group(1).upper())
+
+    return False
+
+
+# =====================================================================
 # 14. COMMAND HANDLER
 # =====================================================================
 def handle_command(raw_text: str, phone: str, user: dict | None) -> bool:
@@ -1862,6 +2288,13 @@ def handle_command(raw_text: str, phone: str, user: dict | None) -> bool:
             send_whatsapp_reply(phone, "Sorry, only admins can list users.")
         else:
             send_whatsapp_reply(phone, "You are not registered. Contact your administrator.")
+        return True
+
+    # --- REQUISITION WORKFLOW ---
+    # Handles: req (start), in-progress flow, approve/reject, pending/approved/
+    # receipted/rejected/summary, view/status. Checked before greeting/help so
+    # an in-progress requisition flow always takes priority.
+    if handle_requisition_command(raw_text, phone, user):
         return True
 
     # --- GREETING ---
@@ -1967,13 +2400,32 @@ def handle_command(raw_text: str, phone: str, user: dict | None) -> bool:
             if last_row_index is None:
                 send_whatsapp_reply(phone, "No entries found from your number to undo.")
                 return True
-            deleted_row = all_values[last_row_index - 1]
+            deleted_row  = all_values[last_row_index - 1]
+            entity_type  = user["entity_type"] if user else DEFAULT_ENTITY_TYPE
             target_sheet.delete_rows(last_row_index)
+
+            # Column layout differs between NGO and for-profit
+            if entity_type == "for-profit":
+                # D=Purpose(3), E=Line Item(4), F=Cash In(5), G=Cash Out(6)
+                activity_label = deleted_row[3] if len(deleted_row) > 3 else "N/A"
+                item_label     = deleted_row[4] if len(deleted_row) > 4 else "N/A"
+                cash_in        = deleted_row[5] if len(deleted_row) > 5 else ""
+                cash_out       = deleted_row[6] if len(deleted_row) > 6 else ""
+                amount_str     = (
+                    f"Cash In: UGX {cash_in}"   if cash_in  else
+                    f"Cash Out: UGX {cash_out}"  if cash_out else "N/A"
+                )
+            else:
+                # D=Primary Activity(3), F=Line Item(5), G=Amount(6)
+                activity_label = deleted_row[3] if len(deleted_row) > 3 else "N/A"
+                item_label     = deleted_row[5] if len(deleted_row) > 5 else "N/A"
+                amount_str     = f"UGX {deleted_row[6]}" if len(deleted_row) > 6 else "N/A"
+
             send_whatsapp_reply(
                 phone,
                 f"Undone! Deleted your last entry:\n"
-                f"  Activity: {deleted_row[3]}\n"
-                f"  Item: {deleted_row[5]} - UGX {deleted_row[6]}"
+                f"  Activity: {activity_label}\n"
+                f"  Item: {item_label} - {amount_str}"
             )
             log.info(f"Row {last_row_index} deleted by {phone}")
         except Exception as e:
@@ -1987,25 +2439,87 @@ def handle_command(raw_text: str, phone: str, user: dict | None) -> bool:
             target_sheet = get_user_sheet(user) if user else gc_client.open(
                 accounting_config[DEFAULT_ENTITY_TYPE]["sheet_name"]
             ).sheet1
-            all_values = target_sheet.get_all_values()[1:]
-            # Column indices shifted by 1 since we added Name column
-            total = sum(
-                int(row[6]) for row in all_values
-                if row[1] == phone and len(row) > 11 and row[11] == "Expense"
-            )
-            income = sum(
-                int(row[6]) for row in all_values
-                if row[1] == phone and len(row) > 11 and row[11] == "Income"
-            )
-            send_whatsapp_reply(
-                phone,
-                f"Your logged totals:\n"
-                f"  Income:  UGX {income:,}\n"
-                f"  Expense: UGX {total:,}\n"
-                f"  Net:     UGX {income - total:,}"
-            )
+            all_rows   = target_sheet.get_all_values()[1:]  # skip header
+            entity_type = user["entity_type"] if user else DEFAULT_ENTITY_TYPE
+            currency   = "UGX"
+
+            def safe_int(val):
+                try:
+                    return int(str(val).replace(",", "").replace(" ", "")) if val else 0
+                except (ValueError, TypeError):
+                    return 0
+
+            if entity_type == "for-profit":
+                # For-profit layout:
+                # B=phone(1), F=cash_in(5), G=cash_out(6), I=type(8)
+                my_rows = [r for r in all_rows if len(r) > 8 and r[1] == phone]
+                total_in      = sum(safe_int(r[5]) for r in my_rows)
+                total_out     = sum(safe_int(r[6]) for r in my_rows)
+                drawings_out  = sum(safe_int(r[6]) for r in my_rows if r[8] == "Drawings")
+                expense_out   = sum(safe_int(r[6]) for r in my_rows if r[8] == "Expense")
+                capital_in    = sum(safe_int(r[5]) for r in my_rows if r[8] == "Capital Investment")
+                revenue_in    = sum(safe_int(r[5]) for r in my_rows if r[8] == "Income")
+                net           = total_in - total_out
+
+                lines = [f"*Balance Summary*\n"]
+                lines.append(f"  Cash In:    {currency} {total_in:,}")
+                lines.append(f"  Cash Out:   {currency} {total_out:,}")
+                lines.append(f"  Net:        {currency} {net:,}\n")
+                lines.append("*Breakdown:*")
+                if revenue_in:
+                    lines.append(f"  Revenue:             {currency} {revenue_in:,}")
+                if capital_in:
+                    lines.append(f"  Capital Contributions: {currency} {capital_in:,}")
+                if expense_out:
+                    lines.append(f"  Business Expenses:   {currency} {expense_out:,}")
+                if drawings_out:
+                    lines.append(f"  Drawings:            {currency} {drawings_out:,}")
+                send_whatsapp_reply(phone, "\n".join(lines))
+
+            else:
+                # NGO layout:
+                # B=phone(1), G=amount(6), J=category(9), L=type(11)
+                my_rows = [r for r in all_rows if len(r) > 11 and r[1] == phone]
+
+                # Group expenses by category
+                from collections import defaultdict
+                by_category  = defaultdict(int)
+                income_total = 0
+                expense_total = 0
+
+                for r in my_rows:
+                    tx_type  = r[11]
+                    amount   = safe_int(r[6])
+                    category = r[9] if r[9] else "Uncategorised"
+
+                    if tx_type == "Income":
+                        income_total += amount
+                    elif tx_type == "Expense":
+                        by_category[category] += amount
+                        expense_total += amount
+
+                lines = [f"*Balance by Account*\n"]
+
+                if income_total:
+                    lines.append(f"  Total Income:  {currency} {income_total:,}\n")
+
+                lines.append("*Expenses by Account:*")
+                if by_category:
+                    # Sort by amount descending so biggest spend shows first
+                    for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
+                        # Shorten the category label (remove leading code if present)
+                        label = cat.split(" - ", 1)[-1] if " - " in cat else cat
+                        lines.append(f"  {label}: {currency} {amt:,}")
+                    lines.append(f"\n  Total Expenses: {currency} {expense_total:,}")
+                else:
+                    lines.append("  No expenses logged yet.")
+
+                net = income_total - expense_total
+                lines.append(f"  Net:            {currency} {net:,}")
+                send_whatsapp_reply(phone, "\n".join(lines))
+
         except Exception as e:
-            log.error(f"Balance check failed: {e}")
+            log.error(f"Balance check failed: {e}", exc_info=True)
             send_whatsapp_reply(phone, "Could not retrieve balance. Please try again.")
         return True
 
@@ -2202,28 +2716,12 @@ def handle_incoming_whatsapp_message(raw_text: str, phone: str):
     if handle_command(raw_text, phone, user):
         return
 
-    # --- Step 3: Block unregistered users from logging transactions ---
-    # Master user is always allowed through — they may not be in the Users tab
-    # for every org they serve, so we resolve their sheet separately.
-    if MASTER_PHONE and phone == MASTER_PHONE:
-        sheet_name, needs_choice = get_master_active_sheet(phone)
-        if needs_choice:
-            # A prompt was sent asking master to choose an org — stop here
-            return
-        # Inject the resolved sheet into a synthetic user dict so the
-        # rest of the function (Gemini call, write_batch_to_sheet) works normally
-        if not user:
-            user = {
-                "name":           "Xan (Master)",
-                "entity_type":    DEFAULT_ENTITY_TYPE,
-                "role":           "admin",
-                "sheet_override": sheet_name,
-            }
-        else:
-            user = dict(user)  # copy so we don't mutate the cache
-            user["sheet_override"] = sheet_name
-
-    elif not user:
+    # --- Step 3: Resolve sender + sheet (handles master routing too) ---
+    user, sheet_name, needs_choice = resolve_sender(phone)
+    if needs_choice:
+        # A prompt was already sent asking master to choose an org
+        return
+    if not user:
         send_whatsapp_reply(
             phone,
             "Sorry, your number is not registered in our system.\n\n"
@@ -2238,7 +2736,32 @@ def handle_incoming_whatsapp_message(raw_text: str, phone: str):
     coa_context        = build_coa_context(entity_type)
     corrections_context = build_corrections_context(entity_type)  # inject learned corrections
 
-    full_prompt = f"""
+    # For-profit gets a simpler prompt — no CoA anchoring rules needed
+    if entity_type == "for-profit" and not fetch_coa_rules(entity_type):
+        full_prompt = f"""
+{system_instruction}
+
+{coa_context}
+
+{corrections_context}
+
+================================================================
+HOW TO PROCESS A FOR-PROFIT MESSAGE:
+
+STEP 1 - Identify each separate amount in the message.
+STEP 2 - For each amount, determine whether it is money coming IN or going OUT:
+         Cash IN  → type = "Income" (sales, services) or "Capital Investment" (owner funds in)
+         Cash OUT → type = "Expense" (business spending) or "Drawings" (owner takes money out)
+STEP 3 - Assign a sensible category and activity_code using best judgment.
+STEP 4 - Fill purpose (what it was for), line_item (specific item), who, amount, record_type.
+STEP 5 - Set primary_activity to the main business activity described.
+================================================================
+
+Now process this message from {user.get("name", "a staff member")}:
+"{raw_text}"
+"""
+    else:
+        full_prompt = f"""
 {system_instruction}
 
 {coa_context}
@@ -2256,7 +2779,7 @@ STEP 5 - Create one row per amount. Apply cost center anchoring rules.
 STEP 6 - Fill purpose, line_item, who, location, amount, type, record_type.
 ================================================================
 
-Now process this message from {user.get('name', 'a staff member')}:
+Now process this message from {user.get("name", "a staff member")}:
 "{raw_text}"
 """
 
@@ -2413,38 +2936,90 @@ def update_receipt_link_in_sheet(sheet_name: str, row_numbers: list[int], drive_
         log.error(f"Failed to update receipt link in '{sheet_name}': {e}")
 
 
-def handle_receipt_photo(message: dict, sender_phone: str):
+def handle_requisition_receipt(req_number: str, media_id: str, sender_phone: str):
     """
-    Process an incoming image message as a potential transaction receipt.
-
-    Flow:
-      1. Extract media ID and caption from the message
-      2. Look for a TXN reference in the caption (e.g. TXN-2026-0001)
-      3. If found: download image → upload to org Drive folder → update sheet rows
-      4. If not found: prompt user to resend with the reference in the caption
+    Attach a receipt photo to an approved requisition and mark it Receipted.
+    Always forwards a copy to the master phone for visibility/audit,
+    in addition to (attempted) Drive storage.
     """
-    image_data = message.get("image", {})
-    media_id   = image_data.get("id", "")
-    caption    = image_data.get("caption", "").strip()
-
-    # Try to find a TXN reference in the caption
-    matches = RECEIPT_REF_PATTERN.findall(caption)
-    txn_ref = matches[0].upper() if matches else None
-
-    if not txn_ref:
+    resolved_user, sheet_name, needs_choice = resolve_sender(sender_phone)
+    if needs_choice or not sheet_name:
         send_whatsapp_reply(
             sender_phone,
-            "I received your photo but could not find a transaction reference in the caption.\n\n"
-            "To attach a receipt, resend the photo with the transaction reference in the caption.\n"
-            "Example caption: *TXN-2026-0001*\n\n"
-            "(The reference was sent to you when you confirmed the transaction.)"
+            f"Could not resolve which sheet *{req_number}* belongs to. Please try again."
         )
         return
 
-    # Look up the ref
+    detail = req.get_requisition_detail(gc_client, sheet_name, req_number)
+    if not detail:
+        send_whatsapp_reply(sender_phone, f"I could not find requisition *{req_number}*.")
+        return
+
+    if detail["status"] == req.STATUS_PENDING:
+        send_whatsapp_reply(
+            sender_phone,
+            f"*{req_number}* is still pending approval — please wait for it to be "
+            "approved before submitting a receipt."
+        )
+        return
+    if detail["status"] == req.STATUS_REJECTED:
+        send_whatsapp_reply(sender_phone, f"*{req_number}* was rejected and cannot be receipted.")
+        return
+    if detail["status"] == req.STATUS_RECEIPTED:
+        send_whatsapp_reply(sender_phone, f"*{req_number}* already has a receipt attached.")
+        return
+
+    send_whatsapp_reply(sender_phone, f"Got it! Attaching receipt to *{req_number}*...")
+    image_bytes = download_whatsapp_media(media_id)
+    if not image_bytes:
+        send_whatsapp_reply(
+            sender_phone,
+            "Sorry, I could not download the image from WhatsApp. Please try sending it again."
+        )
+        return
+
+    filename    = f"{req_number}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+    folder_name = sheet_name
+    drive_link  = upload_receipt_to_drive_org(image_bytes, filename, folder_name)
+
+    sender_name = resolved_user.get("name", sender_phone) if resolved_user else sender_phone
+
+    # Always forward a copy to the master phone — receipts should be visible
+    # to the Admin/Master for audit purposes, regardless of Drive availability.
+    forward_receipt_to_master(image_bytes, filename, req_number, sender_name, sender_phone)
+
+    link_or_note = drive_link or (
+        f"Archived to master WhatsApp on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    success, data = req.receipt_requisition(gc_client, sheet_name, req_number, link_or_note)
+
+    if not success:
+        send_whatsapp_reply(sender_phone, data.get("error", "Could not mark this requisition as receipted."))
+        return
+
+    if drive_link:
+        send_whatsapp_reply(
+            sender_phone,
+            f"Receipt attached to *{req_number}* and marked as Receipted.\n\n"
+            f"View: {drive_link}"
+        )
+    else:
+        send_whatsapp_reply(
+            sender_phone,
+            f"Receipt for *{req_number}* received and marked as Receipted.\n\n"
+            "(Saved to the admin's WhatsApp archive — Drive storage is not "
+            "available for service accounts on personal Google accounts.)"
+        )
+
+
+def handle_legacy_txn_receipt(txn_ref: str, media_id: str, sender_phone: str):
+    """
+    Attach a receipt photo to a confirmed batch from the old free-form
+    transaction flow (reference format TXN-YYYY-NNNN). Kept for backward
+    compatibility with transactions logged before the requisition workflow.
+    """
     ref_info = pending_receipt_refs.get(txn_ref)
 
-    # Check expiry
     if ref_info and datetime.datetime.now() > ref_info["expires_at"]:
         del pending_receipt_refs[txn_ref]
         ref_info = None
@@ -2460,7 +3035,6 @@ def handle_receipt_photo(message: dict, sender_phone: str):
         )
         return
 
-    # Download the image
     send_whatsapp_reply(sender_phone, f"Got it! Attaching receipt to *{txn_ref}*...")
     image_bytes = download_whatsapp_media(media_id)
 
@@ -2471,7 +3045,6 @@ def handle_receipt_photo(message: dict, sender_phone: str):
         )
         return
 
-    # Upload to the org's Drive folder — try first, fall back to WhatsApp archive
     sheet_name  = ref_info["sheet_name"]
     folder_name = sheet_name
     filename    = f"{txn_ref}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
@@ -2479,7 +3052,6 @@ def handle_receipt_photo(message: dict, sender_phone: str):
     drive_link = upload_receipt_to_drive_org(image_bytes, filename, folder_name)
 
     if drive_link:
-        # Drive upload succeeded
         update_receipt_link_in_sheet(sheet_name, ref_info["row_numbers"], drive_link)
         del pending_receipt_refs[txn_ref]
         send_whatsapp_reply(
@@ -2488,10 +3060,7 @@ def handle_receipt_photo(message: dict, sender_phone: str):
             f"View: {drive_link}"
         )
     else:
-        # Drive failed (likely storage quota) — forward to master WhatsApp instead
         log.warning(f"Drive upload failed for {txn_ref} — forwarding to master WhatsApp.")
-
-        # Get sender name from user registry if possible
         sender_user  = get_user(sender_phone)
         sender_name  = sender_user.get("name", sender_phone) if sender_user else sender_phone
 
@@ -2516,6 +3085,39 @@ def handle_receipt_photo(message: dict, sender_phone: str):
                 f"Receipt for *{txn_ref}* received but could not be stored automatically.\n\n"
                 "Please send it directly to your administrator for manual filing."
             )
+
+
+def handle_receipt_photo(message: dict, sender_phone: str):
+    """
+    Process an incoming image message as a potential receipt.
+
+    Flow:
+      1. Extract media ID and caption from the message
+      2. Look for a REQ- reference first (requisition workflow — primary path)
+      3. Fall back to a TXN- reference (legacy free-form transaction flow)
+      4. If neither found: prompt user to resend with the reference in the caption
+    """
+    image_data = message.get("image", {})
+    media_id   = image_data.get("id", "")
+    caption    = image_data.get("caption", "").strip()
+
+    req_matches = req.REQ_REF_PATTERN.findall(caption)
+    if req_matches:
+        handle_requisition_receipt(req_matches[0].upper(), media_id, sender_phone)
+        return
+
+    txn_matches = RECEIPT_REF_PATTERN.findall(caption)
+    if txn_matches:
+        handle_legacy_txn_receipt(txn_matches[0].upper(), media_id, sender_phone)
+        return
+
+    send_whatsapp_reply(
+        sender_phone,
+        "I received your photo but could not find a requisition reference in the caption.\n\n"
+        "To attach a receipt, resend the photo with the reference in the caption.\n"
+        "Example caption: *REQ-2026-0001*\n\n"
+        "(The reference was sent to you when your requisition was approved.)"
+    )
 
 
 # =====================================================================
